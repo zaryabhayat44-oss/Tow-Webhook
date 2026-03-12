@@ -10,7 +10,6 @@ app.use((req, res, next) => {
 
 const PORT = process.env.PORT || 3000;
 const ORS_API_KEY = process.env.ORS_API_KEY;
-const BASE_URL = process.env.BASE_URL || "";
 
 // ─── Pricing ───────────────────────────────────────────────────────────────
 const PRICING = {
@@ -93,62 +92,21 @@ async function runGetQuote({ origin, destination, duty_class, vehicle }) {
   return { vehicle, duty_class: tier.label, hook_fee: tier.hookFee, miles, duration: `${durationMin} mins`, mileage_rate: MILEAGE_RATE, mileage_cost: mileageCost, total, spoken_quote };
 }
 
-// ─── SSE clients ───────────────────────────────────────────────────────────
-const clients = new Map();
-let clientId = 0;
+// ─── HTTP Streamable MCP endpoint (POST /mcp) ──────────────────────────────
+// GHL uses HTTP Streamable transport - single POST endpoint
+app.post("/mcp", async (req, res) => {
+  const { jsonrpc, id, method, params } = req.body;
 
-// ─── MCP: SSE endpoint ─────────────────────────────────────────────────────
-app.get("/sse", (req, res) => {
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
+  console.log(`MCP method: ${method}`);
+
+  // Set headers for potential streaming
+  res.setHeader("Content-Type", "application/json");
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.flushHeaders();
-
-  const id = ++clientId;
-  clients.set(id, res);
-
-  console.log(`SSE client connected: ${id}`);
-
-  // Use full absolute URL so GHL can POST back correctly
-  const messageUrl = `${BASE_URL}/message?clientId=${id}`;
-  console.log(`Sending endpoint URI: ${messageUrl}`);
-  res.write(`event: endpoint\ndata: ${JSON.stringify({ uri: messageUrl })}\n\n`);
-
-  // Keep alive ping every 15s
-  const ping = setInterval(() => {
-    res.write(`: ping\n\n`);
-  }, 15000);
-
-  req.on("close", () => {
-    console.log(`SSE client disconnected: ${id}`);
-    clients.delete(id);
-    clearInterval(ping);
-  });
-});
-
-// ─── MCP: Message endpoint ─────────────────────────────────────────────────
-app.post("/message", async (req, res) => {
-  const id = parseInt(req.query.clientId);
-  const client = clients.get(id);
-  const body = req.body;
-
-  console.log(`Message from client ${id}:`, JSON.stringify(body));
-
-  const { jsonrpc, id: rpcId, method, params } = body;
-
-  const send = (payload) => {
-    console.log(`Sending to client ${id}:`, JSON.stringify(payload));
-    if (client) {
-      client.write(`event: message\ndata: ${JSON.stringify(payload)}\n\n`);
-    }
-    res.json({ status: "ok" });
-  };
 
   if (method === "initialize") {
-    return send({
+    return res.json({
       jsonrpc,
-      id: rpcId,
+      id,
       result: {
         protocolVersion: "2024-11-05",
         serverInfo: { name: "towco-mcp", version: "1.0.0" },
@@ -158,13 +116,13 @@ app.post("/message", async (req, res) => {
   }
 
   if (method === "notifications/initialized") {
-    return res.json({ status: "ok" });
+    return res.status(200).json({ jsonrpc, id, result: {} });
   }
 
   if (method === "tools/list") {
-    return send({
+    return res.json({
       jsonrpc,
-      id: rpcId,
+      id,
       result: { tools: TOOLS },
     });
   }
@@ -176,16 +134,16 @@ app.post("/message", async (req, res) => {
       if (name === "get_quote") result = await runGetQuote(args);
       else throw new Error(`Unknown tool: ${name}`);
 
-      return send({
+      return res.json({
         jsonrpc,
-        id: rpcId,
+        id,
         result: { content: [{ type: "text", text: JSON.stringify(result) }] },
       });
     } catch (err) {
       console.error("Tool error:", err.message);
-      return send({
+      return res.json({
         jsonrpc,
-        id: rpcId,
+        id,
         result: {
           content: [{ type: "text", text: JSON.stringify({ error: err.message }) }],
           isError: true,
@@ -194,11 +152,65 @@ app.post("/message", async (req, res) => {
     }
   }
 
-  console.log(`Unhandled method: ${method}`);
+  // Handle OPTIONS preflight
+  return res.status(200).json({ jsonrpc, id, result: {} });
+});
+
+// ─── OPTIONS preflight for CORS ────────────────────────────────────────────
+app.options("/mcp", (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.sendStatus(200);
+});
+
+// ─── Keep SSE endpoint as fallback ─────────────────────────────────────────
+const clients = new Map();
+let clientId = 0;
+
+app.get("/sse", (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.flushHeaders();
+
+  const id = ++clientId;
+  clients.set(id, res);
+
+  const BASE_URL = process.env.BASE_URL || "";
+  res.write(`event: endpoint\ndata: ${JSON.stringify({ uri: `${BASE_URL}/message?clientId=${id}` })}\n\n`);
+
+  const ping = setInterval(() => res.write(`: ping\n\n`), 15000);
+  req.on("close", () => { clients.delete(id); clearInterval(ping); });
+});
+
+app.post("/message", async (req, res) => {
+  const id = parseInt(req.query.clientId);
+  const client = clients.get(id);
+  const { jsonrpc, id: rpcId, method, params } = req.body;
+
+  const send = (payload) => {
+    if (client) client.write(`event: message\ndata: ${JSON.stringify(payload)}\n\n`);
+    res.json({ status: "ok" });
+  };
+
+  if (method === "initialize") return send({ jsonrpc, id: rpcId, result: { protocolVersion: "2024-11-05", serverInfo: { name: "towco-mcp", version: "1.0.0" }, capabilities: { tools: {} } } });
+  if (method === "notifications/initialized") return res.json({ status: "ok" });
+  if (method === "tools/list") return send({ jsonrpc, id: rpcId, result: { tools: TOOLS } });
+  if (method === "tools/call") {
+    const { name, arguments: args } = params;
+    try {
+      const result = name === "get_quote" ? await runGetQuote(args) : (() => { throw new Error(`Unknown tool: ${name}`) })();
+      return send({ jsonrpc, id: rpcId, result: { content: [{ type: "text", text: JSON.stringify(result) }] } });
+    } catch (err) {
+      return send({ jsonrpc, id: rpcId, result: { content: [{ type: "text", text: JSON.stringify({ error: err.message }) }], isError: true } });
+    }
+  }
   res.json({ status: "ok" });
 });
 
 // ─── Health check ──────────────────────────────────────────────────────────
-app.get("/", (req, res) => res.json({ status: "Towco MCP server running", base_url: BASE_URL }));
+app.get("/", (req, res) => res.json({ status: "Towco MCP server running" }));
 
-app.listen(PORT, () => console.log(`Towco MCP server running on port ${PORT}, BASE_URL: ${BASE_URL}`));
+app.listen(PORT, () => console.log(`Towco MCP server running on port ${PORT}`));
