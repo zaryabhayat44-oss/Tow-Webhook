@@ -4,12 +4,13 @@ import axios from "axios";
 const app = express();
 app.use(express.json());
 app.use((req, res, next) => {
-  console.log(`${req.method} ${req.url}`, JSON.stringify(req.body));
+  console.log(`${new Date().toISOString()} ${req.method} ${req.url}`, JSON.stringify(req.body || {}));
   next();
 });
 
 const PORT = process.env.PORT || 3000;
 const ORS_API_KEY = process.env.ORS_API_KEY;
+const BASE_URL = process.env.BASE_URL || "";
 
 // ─── Pricing ───────────────────────────────────────────────────────────────
 const PRICING = {
@@ -109,8 +110,9 @@ app.get("/sse", (req, res) => {
 
   console.log(`SSE client connected: ${id}`);
 
-  // Send endpoint event
-  const messageUrl = `/message?clientId=${id}`;
+  // Use full absolute URL so GHL can POST back correctly
+  const messageUrl = `${BASE_URL}/message?clientId=${id}`;
+  console.log(`Sending endpoint URI: ${messageUrl}`);
   res.write(`event: endpoint\ndata: ${JSON.stringify({ uri: messageUrl })}\n\n`);
 
   // Keep alive ping every 15s
@@ -192,12 +194,11 @@ app.post("/message", async (req, res) => {
     }
   }
 
-  // Catch-all
   console.log(`Unhandled method: ${method}`);
   res.json({ status: "ok" });
 });
 
 // ─── Health check ──────────────────────────────────────────────────────────
-app.get("/", (req, res) => res.json({ status: "Towco MCP server running" }));
+app.get("/", (req, res) => res.json({ status: "Towco MCP server running", base_url: BASE_URL }));
 
-app.listen(PORT, () => console.log(`Towco MCP server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Towco MCP server running on port ${PORT}, BASE_URL: ${BASE_URL}`));
