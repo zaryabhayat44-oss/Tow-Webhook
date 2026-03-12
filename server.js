@@ -3,6 +3,10 @@ import axios from "axios";
 
 const app = express();
 app.use(express.json());
+app.use((req, res, next) => {
+  console.log(`${req.method} ${req.url}`, JSON.stringify(req.body));
+  next();
+});
 
 const PORT = process.env.PORT || 3000;
 const ORS_API_KEY = process.env.ORS_API_KEY;
@@ -56,7 +60,7 @@ async function geocode(address) {
   return feature.geometry.coordinates;
 }
 
-// ─── Helper: Run get_quote tool ────────────────────────────────────────────
+// ─── Helper: Run get_quote ─────────────────────────────────────────────────
 async function runGetQuote({ origin, destination, duty_class, vehicle }) {
   const tier = PRICING[duty_class.toLowerCase()];
   if (!tier) throw new Error("duty_class must be light, medium, or heavy");
@@ -103,20 +107,39 @@ app.get("/sse", (req, res) => {
   const id = ++clientId;
   clients.set(id, res);
 
-  // Send endpoint event
-  res.write(`event: endpoint\ndata: ${JSON.stringify({ uri: `/message?clientId=${id}` })}\n\n`);
+  console.log(`SSE client connected: ${id}`);
 
-  req.on("close", () => clients.delete(id));
+  // Send endpoint event
+  const messageUrl = `/message?clientId=${id}`;
+  res.write(`event: endpoint\ndata: ${JSON.stringify({ uri: messageUrl })}\n\n`);
+
+  // Keep alive ping every 15s
+  const ping = setInterval(() => {
+    res.write(`: ping\n\n`);
+  }, 15000);
+
+  req.on("close", () => {
+    console.log(`SSE client disconnected: ${id}`);
+    clients.delete(id);
+    clearInterval(ping);
+  });
 });
 
 // ─── MCP: Message endpoint ─────────────────────────────────────────────────
 app.post("/message", async (req, res) => {
   const id = parseInt(req.query.clientId);
   const client = clients.get(id);
-  const { jsonrpc, id: rpcId, method, params } = req.body;
+  const body = req.body;
+
+  console.log(`Message from client ${id}:`, JSON.stringify(body));
+
+  const { jsonrpc, id: rpcId, method, params } = body;
 
   const send = (payload) => {
-    if (client) client.write(`event: message\ndata: ${JSON.stringify(payload)}\n\n`);
+    console.log(`Sending to client ${id}:`, JSON.stringify(payload));
+    if (client) {
+      client.write(`event: message\ndata: ${JSON.stringify(payload)}\n\n`);
+    }
     res.json({ status: "ok" });
   };
 
@@ -132,8 +155,16 @@ app.post("/message", async (req, res) => {
     });
   }
 
+  if (method === "notifications/initialized") {
+    return res.json({ status: "ok" });
+  }
+
   if (method === "tools/list") {
-    return send({ jsonrpc, id: rpcId, result: { tools: TOOLS } });
+    return send({
+      jsonrpc,
+      id: rpcId,
+      result: { tools: TOOLS },
+    });
   }
 
   if (method === "tools/call") {
@@ -149,15 +180,20 @@ app.post("/message", async (req, res) => {
         result: { content: [{ type: "text", text: JSON.stringify(result) }] },
       });
     } catch (err) {
+      console.error("Tool error:", err.message);
       return send({
         jsonrpc,
         id: rpcId,
-        result: { content: [{ type: "text", text: JSON.stringify({ error: err.message }) }], isError: true },
+        result: {
+          content: [{ type: "text", text: JSON.stringify({ error: err.message }) }],
+          isError: true,
+        },
       });
     }
   }
 
-  // notifications/initialized and others — just ack
+  // Catch-all
+  console.log(`Unhandled method: ${method}`);
   res.json({ status: "ok" });
 });
 
