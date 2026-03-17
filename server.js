@@ -9,7 +9,7 @@ app.use((req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3000;
-const ORS_API_KEY = process.env.ORS_API_KEY;
+const DISTANCEMATRIX_API_KEY = process.env.DISTANCEMATRIX_API_KEY;
 
 // ─── Pricing ───────────────────────────────────────────────────────────────
 const PRICING = {
@@ -30,11 +30,11 @@ const TOOLS = [
       properties: {
         origin: {
           type: "string",
-          description: "Full pickup address including city and state e.g. 123 Main St, Dallas, TX",
+          description: "Full pickup address including city and state exactly as the caller provided it",
         },
         destination: {
           type: "string",
-          description: "Full drop-off address including city and state e.g. 456 Elm St, Fort Worth, TX",
+          description: "Full drop-off address including city and state exactly as the caller provided it",
         },
         duty_class: {
           type: "string",
@@ -50,14 +50,31 @@ const TOOLS = [
   },
 ];
 
-// ─── Helper: Geocode ───────────────────────────────────────────────────────
-async function geocode(address) {
-  const res = await axios.get("https://api.openrouteservice.org/geocode/search", {
-    params: { api_key: ORS_API_KEY, text: address, size: 1 },
+// ─── Helper: Get distance via Distance Matrix AI ───────────────────────────
+async function getDistance(origin, destination) {
+  const res = await axios.get("https://api.distancematrix.ai/maps/api/distancematrix/json", {
+    params: {
+      origins: origin,
+      destinations: destination,
+      key: DISTANCEMATRIX_API_KEY,
+    },
   });
-  const feature = res.data?.features?.[0];
-  if (!feature) throw new Error(`Could not geocode: ${address}`);
-  return feature.geometry.coordinates;
+
+  const data = res.data;
+  console.log("Distance Matrix response:", JSON.stringify(data));
+
+  const element = data?.rows?.[0]?.elements?.[0];
+
+  if (!element || element.status !== "OK") {
+    throw new Error(`Could not calculate distance. Status: ${element?.status || "UNKNOWN"}`);
+  }
+
+  // Distance comes back in meters
+  const meters = element.distance.value;
+  const miles = Math.ceil((meters / 1609.344) * 10) / 10; // never round down
+  const durationText = element.duration.text;
+
+  return { miles, durationText };
 }
 
 // ─── Helper: Run get_quote ─────────────────────────────────────────────────
@@ -65,22 +82,8 @@ async function runGetQuote({ origin, destination, duty_class, vehicle }) {
   const tier = PRICING[duty_class.toLowerCase()];
   if (!tier) throw new Error("duty_class must be light, medium, or heavy");
 
-  const [originCoords, destCoords] = await Promise.all([
-    geocode(origin),
-    geocode(destination),
-  ]);
+  const { miles, durationText } = await getDistance(origin, destination);
 
-  const routeRes = await axios.post(
-    "https://api.openrouteservice.org/v2/directions/driving-car",
-    { coordinates: [originCoords, destCoords] },
-    { headers: { Authorization: ORS_API_KEY, "Content-Type": "application/json" } }
-  );
-
-  const summary = routeRes.data?.routes?.[0]?.summary;
-  if (!summary) throw new Error("No route found between these addresses.");
-
-  const miles = Math.ceil((summary.distance / 1609.344) * 10) / 10;
-  const durationMin = Math.round(summary.duration / 60);
   const mileageCost = parseFloat((miles * MILEAGE_RATE).toFixed(2));
   const total = Math.round(tier.hookFee + mileageCost);
 
@@ -89,17 +92,25 @@ async function runGetQuote({ origin, destination, duty_class, vehicle }) {
     `The distance is ${miles} miles at $${MILEAGE_RATE} a mile, that's $${mileageCost.toFixed(2)}. ` +
     `So your total comes out to $${total}.`;
 
-  return { vehicle, duty_class: tier.label, hook_fee: tier.hookFee, miles, duration: `${durationMin} mins`, mileage_rate: MILEAGE_RATE, mileage_cost: mileageCost, total, spoken_quote };
+  return {
+    vehicle,
+    duty_class: tier.label,
+    hook_fee: tier.hookFee,
+    miles,
+    duration: durationText,
+    mileage_rate: MILEAGE_RATE,
+    mileage_cost: mileageCost,
+    total,
+    spoken_quote,
+  };
 }
 
-// ─── HTTP Streamable MCP endpoint (POST /mcp) ──────────────────────────────
-// GHL uses HTTP Streamable transport - single POST endpoint
+// ─── HTTP Streamable MCP endpoint ─────────────────────────────────────────
 app.post("/mcp", async (req, res) => {
   const { jsonrpc, id, method, params } = req.body;
 
   console.log(`MCP method: ${method}`);
 
-  // Set headers for potential streaming
   res.setHeader("Content-Type", "application/json");
   res.setHeader("Access-Control-Allow-Origin", "*");
 
@@ -152,11 +163,10 @@ app.post("/mcp", async (req, res) => {
     }
   }
 
-  // Handle OPTIONS preflight
   return res.status(200).json({ jsonrpc, id, result: {} });
 });
 
-// ─── OPTIONS preflight for CORS ────────────────────────────────────────────
+// ─── OPTIONS preflight ─────────────────────────────────────────────────────
 app.options("/mcp", (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
@@ -164,7 +174,7 @@ app.options("/mcp", (req, res) => {
   res.sendStatus(200);
 });
 
-// ─── Keep SSE endpoint as fallback ─────────────────────────────────────────
+// ─── SSE fallback ──────────────────────────────────────────────────────────
 const clients = new Map();
 let clientId = 0;
 
